@@ -19,7 +19,10 @@ from diffusers.utils import is_accelerate_available
 from torch.hub import download_url_to_file
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from lib_layerdiffuse.vae import TransparentVAEDecoder, TransparentVAEEncoder
+from layerdiffuse.lib_layerdiffuse.vae import (
+    TransparentVAEDecoder,
+    TransparentVAEEncoder,
+)
 
 if is_accelerate_available():
     from accelerate import init_empty_weights
@@ -51,7 +54,7 @@ def download_sth(path: str, url: str):
     return path
 
 
-def load_models(model_dir: str, ckpt_path: str, method):
+def load_models(model_dir: str, ckpt_path: str, method: LayerMethod):
     """
     Only SDXL models Supported
 
@@ -75,8 +78,8 @@ def load_models(model_dir: str, ckpt_path: str, method):
     modified_st = origin_st.copy()
     inject_st = sf.load_file(
         download_sth(
-            os.path.join(model_dir, method.filename),
-            f"{hf_endpoint}/LayerDiffusion/layerdiffusion-v1/resolve/main/{method.filename}",
+            os.path.join(model_dir, method.value.filename),
+            f"{hf_endpoint}/LayerDiffusion/layerdiffusion-v1/resolve/main/{method.value.filename}",
         )
     )
     with open(
@@ -155,7 +158,7 @@ def load_models(model_dir: str, ckpt_path: str, method):
         origin_unet.load_state_dict(converted_unet_checkpoint)
 
     # Build modified UNet
-    unet_config["in_channels"] = method.unet_input_channels
+    unet_config["in_channels"] = method.value.unet_input_channels
     for it in inject_st.keys():
         key, inject_type, i = it.split("::")
         key = "model." + key

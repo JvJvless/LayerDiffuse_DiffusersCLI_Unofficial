@@ -8,9 +8,14 @@ from PIL import Image
 
 import memory_management
 from diffusers_kdiffusion_sdxl import KDiffusionStableDiffusionXLPipeline
-from lib_layerdiffuse.utils import ResizeMode, crop_and_resize_image, rgba2rgbfp32
+from layerdiffuse.lib_layerdiffuse.utils import (
+    ResizeMode,
+    crop_and_resize_image,
+    rgba2rgbfp32,
+)
 from utility import LayerMethod, load_models
 
+# 加载模型
 (
     tokenizer,
     tokenizer_2,
@@ -24,7 +29,7 @@ from utility import LayerMethod, load_models
 ) = load_models(
     "./models",
     "./models/juggernautXL_version6Rundiffusion.safetensors",
-    LayerMethod.BG_TO_BLEND.value,
+    LayerMethod.BG_TO_BLEND,
 )
 
 pipe = KDiffusionStableDiffusionXLPipeline(
@@ -40,6 +45,22 @@ pipe = KDiffusionStableDiffusionXLPipeline(
     timesteps=1000,
 )
 
+
+def load_condiction(path: str):
+    im = Image.open(path)
+    # assert(bg.mode == "RGBA")
+    if im.mode == "RGBA":
+        im = rgba2rgbfp32(np.array(im))
+    else:
+        im = np.array(im, dtype=np.float32) / 255.0
+    im = crop_and_resize_image(im, ResizeMode.CROP_AND_RESIZE, height * 8, width * 8) if im is not None else None
+    if im is not None:
+        im = 2.0 * torch.from_numpy(np.ascontiguousarray(im[None]).copy()).movedim(-1, 1) - 1.0
+        im = vae.encode(im).latent_dist.sample()
+        im *= 0.13025
+    return im
+
+
 positive_tags = "man in room"
 default_negative = "face asymmetry, eyes asymmetry, deformed eyes, open mouth"
 height = 144
@@ -50,18 +71,8 @@ with torch.inference_mode():
 
     rng = torch.Generator(device=memory_management.gpu).manual_seed(12345)
 
-    bg_image = Image.open("./results/bg.png")
-    # assert(bg.mode == "RGBA")
-    if bg_image.mode == "RGBA":
-        bg_image = rgba2rgbfp32(np.array(bg_image))
-    else:
-        bg_image = np.array(bg_image, dtype=np.float32) / 255.0
-    bg_image = crop_and_resize_image(bg_image, ResizeMode.CROP_AND_RESIZE, height * 8, width * 8) if bg_image is not None else None
-    if bg_image is not None:
-        bg_image = vae.encode(torch.from_numpy(np.ascontiguousarray(bg_image[..., None].transpose((3, 2, 0, 1)).copy()))).latent_dist.sample()
-        # bg_image = unet.model.latent_format.process_in(bg_image)
-        bg_image *= 0.13025
-    cond = bg_image
+    # 对于双条件的method，需要concat起来
+    cond = load_condiction("./results/bg.png")
 
     memory_management.load_models_to_gpu([text_encoder, text_encoder_2])
     positive_cond, positive_pooler = pipe.encode_cropped_prompt_77tokens(positive_tags)
@@ -83,9 +94,19 @@ with torch.inference_mode():
         guidance_scale=guidance_scale,
     ).images
 
-    memory_management.load_models_to_gpu([vae, transparent_decoder, transparent_encoder])
+    # 2blend 不需要transparent_decode
+    # 对于2fg的，改用下两行被注释的代码
+    # memory_management.load_models_to_gpu([vae, transparent_decoder])
+    # result_list, vis_list = transparent_decoder(vae, latents)
+    memory_management.load_models_to_gpu([vae])
     latents = latents.to(dtype=vae.dtype, device=vae.device) / vae.config.scaling_factor
-    result_list, vis_list = transparent_decoder(vae, latents)
+    pixels = vae.decode(latents).sample
+    pixels = (pixels * 0.5 + 0.5).clip(0, 1).movedim(1, -1)
+
+    result_list = []
+    for i in range(int(pixels.shape[0])):
+        ret = (pixels[i] * 255.0).detach().cpu().float().numpy().clip(0, 255).astype(np.uint8)
+        result_list.append(ret)
 
     os.makedirs("./results", exist_ok=True)
     for i, image in enumerate(result_list):

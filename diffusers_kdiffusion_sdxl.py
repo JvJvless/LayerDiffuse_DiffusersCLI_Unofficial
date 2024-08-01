@@ -79,14 +79,16 @@ class KModel:
 
     def __call__(self, x, sigma, cond, **extra_args):
         t = self.timestep(sigma)
+
+        x_ddim_space = x / (sigma[:, None, None, None] ** 2 + self.sigma_data**2) ** 0.5
+
         if t < self.ending_step:
             unet = self.unet
-            cx = torch.concat([x] + cond, dim=1)
+            x_ddim_space = torch.concat([x_ddim_space] + cond, dim=1)
         else:
             unet = self.origin_unet
-            cx = x
+            x_ddim_space = x
 
-        x_ddim_space = cx / (sigma[:, None, None, None] ** 2 + self.sigma_data**2) ** 0.5
         cfg_scale = extra_args["cfg_scale"]
         eps_positive = unet(x_ddim_space, t, return_dict=False, **extra_args["positive"])[0]
         eps_negative = unet(x_ddim_space, t, return_dict=False, **extra_args["negative"])[0]
