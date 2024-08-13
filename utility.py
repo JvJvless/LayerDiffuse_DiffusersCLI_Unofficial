@@ -1,3 +1,4 @@
+import copy
 import os
 from contextlib import nullcontext
 from enum import Enum
@@ -7,6 +8,7 @@ import safetensors.torch as sf
 import torch
 import yaml
 from diffusers import AutoencoderKL, UNet2DConditionModel
+from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 from diffusers.pipelines.stable_diffusion.convert_from_ckpt import (
     convert_ldm_clip_checkpoint,
     convert_ldm_unet_checkpoint,
@@ -17,8 +19,9 @@ from diffusers.pipelines.stable_diffusion.convert_from_ckpt import (
 )
 from diffusers.utils import is_accelerate_available
 from torch.hub import download_url_to_file
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import AutoFeatureExtractor, CLIPTextModel, CLIPTokenizer
 
+from layerdiffuse.lib_layerdiffuse.attention_sharing import AttentionSharingPatcher
 from layerdiffuse.lib_layerdiffuse.vae import (
     TransparentVAEDecoder,
     TransparentVAEEncoder,
@@ -34,6 +37,13 @@ hf_endpoint = os.environ["HF_ENDPOINT"] if "HF_ENDPOINT" in os.environ else "htt
 class LayerMethod(Enum):
     def _info(filename: str, description: str, unet_input_channels: int) -> SimpleNamespace:
         return SimpleNamespace(filename=filename, description=description, unet_input_channels=unet_input_channels)
+
+    FG_ONLY_ATTN_SD15 = _info(
+        filename="layer_sd15_transparent_attn.safetensors", description="(SD1.5) Only Generate Transparent Image (Attention Injection)", unet_input_channels=4
+    )
+    FG_TO_BG_SD15 = _info(filename="layer_sd15_fg2bg.safetensors", description="(SD1.5) From Foreground to Background (need batch size 2)", unet_input_channels=4)
+    BG_TO_FG_SD15 = _info(filename="layer_sd15_bg2fg.safetensors", description="(SD1.5) From Background to Foreground (need batch size 2)", unet_input_channels=4)
+    JOINT_SD15 = _info(filename="layer_sd15_joint.safetensors", description="(SD1.5) Generate Everything Together (need batch size 3)", unet_input_channels=4)
 
     FG_ONLY_ATTN = _info(filename="layer_xl_transparent_attn.safetensors", description="(SDXL) Only Generate Transparent Image (Attention Injection)", unet_input_channels=4)
     FG_ONLY_CONV = _info(filename="layer_xl_transparent_conv.safetensors", description="(SDXL) Only Generate Transparent Image (Conv Injection)", unet_input_channels=4)
@@ -54,7 +64,7 @@ def download_sth(path: str, url: str):
     return path
 
 
-def load_models(model_dir: str, ckpt_path: str, method: LayerMethod):
+def load_models_sdxl(model_dir: str, ckpt_path: str, method: LayerMethod):
     """
     Only SDXL models Supported
 
@@ -208,3 +218,117 @@ def load_models(model_dir: str, ckpt_path: str, method: LayerMethod):
         transparent_encoder,
         transparent_decoder,
     )
+
+
+def load_models_sd15(model_dir: str, ckpt_path: str, method: LayerMethod, load_safety_checker=False):
+    """
+    load SD1.5 model
+    """
+    origin_st = sf.load_file(download_sth(ckpt_path, None))
+    inject_st = sf.load_file(
+        download_sth(
+            os.path.join(model_dir, method.value.filename),
+            f"{hf_endpoint}/LayerDiffusion/layerdiffusion-v1/resolve/main/{method.value.filename}",
+        )
+    )
+    with open(
+        download_sth(
+            os.path.join(model_dir, "v1-inference.yaml"),
+            "https://raw.githubusercontent.com/CompVis/stable-diffusion/main/configs/stable-diffusion/v1-inference.yaml",
+        ),
+        "r",
+    ) as f:
+        config = yaml.safe_load(f.read())
+
+    text_model = convert_ldm_clip_checkpoint(origin_st)
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+    if load_safety_checker:
+        safety_checker = StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker")
+        feature_extractor = AutoFeatureExtractor.from_pretrained("CompVis/stable-diffusion-safety-checker")
+    else:
+        safety_checker = None
+        feature_extractor = None
+
+    transparent_encoder = TransparentVAEEncoder(
+        download_sth(
+            os.path.join(model_dir, "layer_sd15_vae_transparent_encoder.safetensors"),
+            f"{hf_endpoint}/LayerDiffusion/layerdiffusion-v1/resolve/main/layer_sd15_vae_transparent_encoder.safetensors",
+        )
+    )
+    transparent_decoder = TransparentVAEDecoder(
+        download_sth(
+            os.path.join(model_dir, "layer_sd15_vae_transparent_decoder.safetensors"),
+            f"{hf_endpoint}/LayerDiffusion/layerdiffusion-v1/resolve/main/layer_sd15_vae_transparent_decoder.safetensors",
+        )
+    )
+
+    ctx = init_empty_weights if is_accelerate_available() else nullcontext
+
+    # Build VAE
+    vae_config = create_vae_diffusers_config(config, image_size=1024)
+    converted_vae_checkpoint = convert_ldm_vae_checkpoint(origin_st, vae_config)
+    if "model" in config and "params" in config["model"] and "scale_factor" in config["model"]["params"]:
+        vae_scaling_factor = config["model"]["params"]["scale_factor"]
+    else:
+        vae_scaling_factor = 0.18215  # default SD scaling factor
+    vae_config["scaling_factor"] = vae_scaling_factor
+    with ctx():
+        vae = AutoencoderKL(**vae_config)
+    if is_accelerate_available():
+        for param_name, param in converted_vae_checkpoint.items():
+            set_module_tensor_to_device(vae, param_name, "cpu", value=param)
+    else:
+        vae.load_state_dict(converted_vae_checkpoint)
+
+    # Build origin UNet
+    unet_config = create_unet_diffusers_config(config, image_size=1024)
+    unet_config["upcast_attention"] = None
+
+    converted_unet_checkpoint = convert_ldm_unet_checkpoint(
+        origin_st,
+        unet_config,
+        path="",
+        extract_ema=False,
+    )
+    with ctx():
+        origin_unet = UNet2DConditionModel(**unet_config)
+    if is_accelerate_available():
+        for param_name, param in converted_unet_checkpoint.items():
+            set_module_tensor_to_device(origin_unet, param_name, "cpu", value=param)
+    else:
+        origin_unet.load_state_dict(converted_unet_checkpoint)
+
+    # Build modified UNet
+    if method == LayerMethod.FG_ONLY_ATTN_SD15:
+        frames = 1
+        use_control = False
+    elif method == LayerMethod.JOINT_SD15:
+        frames = 3
+        use_control = False
+    elif method in [LayerMethod.BG_TO_FG_SD15, LayerMethod.FG_TO_BG_SD15]:
+        frames = 2
+        use_control = True
+    else:
+        raise ValueError("Not supported method, which must be in [FG_ONLY_ATTN_SD15, JOINT_SD15, BG_TO_FG_SD15, FG_TO_BG_SD15].")
+
+    unet = copy.deepcopy(origin_unet)
+    with ctx():
+        patcher = AttentionSharingPatcher(unet, frames=frames, use_control=use_control)
+    if is_accelerate_available():
+        for param_name, param in inject_st.items():
+            set_module_tensor_to_device(patcher, param_name, "cpu", value=param)
+    else:
+        origin_unet.load_state_dict(inject_st)
+
+    return {
+        "tokenizer": tokenizer,
+        "text_encoder": text_model,
+        "vae": vae,
+        "origin_unet": origin_unet,
+        "unet": unet,
+        "patcher": patcher,
+        "safety_checker": safety_checker,
+        "feature_extractor": feature_extractor,
+        "transparent_encoder": transparent_encoder,
+        "transparent_decoder": transparent_decoder,
+    }

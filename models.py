@@ -1,19 +1,17 @@
-from typing import Optional, Tuple
-
+import torch.nn as nn
+import torch
 import cv2
 import numpy as np
-import safetensors.torch as sf
-import torch
-import torch.nn as nn
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
-from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.unets.unet_2d_blocks import (
-    UNetMidBlock2D,
-    get_down_block,
-    get_up_block,
-)
+
 from tqdm import tqdm
+from typing import Optional, Tuple
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.models.unets.unet_2d_blocks import UNetMidBlock2D, get_down_block, get_up_block
+from backend import memory_management
+from backend.patcher.base import ModelPatcher
+from torchvision import transforms
+from PIL import Image
 
 
 def zero_module(module):
@@ -188,9 +186,6 @@ def checkerboard(shape):
 
 
 def build_alpha_pyramid(color, alpha, dk=1.2):
-    # Written by lvmin at Stanford
-    # Massive iterative Gaussian filters are mathematically consistent to pyramid.
-
     pyramid = []
     current_premultiplied_color = color * alpha
     current_alpha = alpha
@@ -208,9 +203,6 @@ def build_alpha_pyramid(color, alpha, dk=1.2):
 
 
 def pad_rgb(np_rgba_hwc_uint8):
-    # Written by lvmin at Stanford
-    # Massive iterative Gaussian filters are mathematically consistent to pyramid.
-
     np_rgba_hwc = np_rgba_hwc_uint8.astype(np.float32) / 255.0
     pyramid = build_alpha_pyramid(color=np_rgba_hwc[..., :3], alpha=np_rgba_hwc[..., 3:])
 
@@ -225,40 +217,30 @@ def pad_rgb(np_rgba_hwc_uint8):
     return fg
 
 
-def dist_sample_deterministic(dist: DiagonalGaussianDistribution, perturbation: torch.Tensor):
-    # Modified from diffusers.models.autoencoders.vae.DiagonalGaussianDistribution.sample()
-    x = dist.mean + dist.std * perturbation.to(dist.std)
-    return x
+class TransparentVAEDecoder:
+    def __init__(self, sd, mod_number=1):
+        self.load_device = memory_management.get_torch_device()
+        self.offload_device = memory_management.unet_offload_device()
+        self.dtype = torch.float16 if memory_management.should_use_fp16(self.load_device) else torch.float32
 
-
-class TransparentVAEDecoder(torch.nn.Module):
-    def __init__(self, filename, dtype=torch.float16, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        sd = sf.load_file(filename)
         model = UNet1024(in_channels=3, out_channels=4)
         model.load_state_dict(sd, strict=True)
-        model.to(dtype=dtype)
+        model.to(device=self.offload_device, dtype=self.dtype)
         model.eval()
-        self.model = model
-        self.dtype = dtype
+
+        self.model = ModelPatcher(model, load_device=self.load_device, offload_device=self.offload_device)
+        self.mod_number = mod_number
         return
 
     @torch.no_grad()
     def estimate_single_pass(self, pixel, latent):
-        y = self.model(pixel, latent)
+        y = self.model.model(pixel, latent)
         return y
 
     @torch.no_grad()
     def estimate_augmented(self, pixel, latent):
         args = [
-            [False, 0],
-            [False, 1],
-            [False, 2],
-            [False, 3],
-            [True, 0],
-            [True, 1],
-            [True, 2],
-            [True, 3],
+            [False, 0], [False, 1], [False, 2], [False, 3], [True, 0], [True, 1], [True, 2], [True, 3],
         ]
 
         result = []
@@ -287,68 +269,57 @@ class TransparentVAEDecoder(torch.nn.Module):
         return median
 
     @torch.no_grad()
-    def forward(self, sd_vae, latent):
-        pixel = sd_vae.decode(latent).sample
-        pixel = (pixel * 0.5 + 0.5).clip(0, 1).to(self.dtype)
-        latent = latent.to(self.dtype)
-        result_list = []
-        vis_list = []
+    def decode(self, latent, pixel):
+        memory_management.load_model_gpu(self.model)
 
-        for i in range(int(latent.shape[0])):
-            y = self.estimate_augmented(pixel[i : i + 1], latent[i : i + 1])
+        latent = latent[None, :, :, :].to(device=self.load_device, dtype=self.dtype)
+        pixel = transforms.ToTensor()(pixel)[None, :, :, :].to(device=self.load_device, dtype=self.dtype)
 
-            y = y.clip(0, 1).movedim(1, -1)
-            alpha = y[..., :1]
-            fg = y[..., 1:]
+        y = self.estimate_augmented(pixel, latent)
 
-            B, H, W, C = fg.shape
-            cb = checkerboard(shape=(H // 64, W // 64))
-            cb = cv2.resize(cb, (W, H), interpolation=cv2.INTER_NEAREST)
-            cb = (0.5 + (cb - 0.5) * 0.1)[None, ..., None]
-            cb = torch.from_numpy(cb).to(fg)
+        y = y.clip(0, 1).movedim(1, -1)
+        alpha = y[..., :1]
+        fg = y[..., 1:]
 
-            vis = (fg * alpha + cb * (1 - alpha))[0]
-            vis = (vis * 255.0).detach().cpu().float().numpy().clip(0, 255).astype(np.uint8)
-            vis_list.append(vis)
+        B, H, W, C = fg.shape
+        cb = checkerboard(shape=(H // 64, W // 64))
+        cb = cv2.resize(cb, (W, H), interpolation=cv2.INTER_NEAREST)
+        cb = (0.5 + (cb - 0.5) * 0.1)[None, ..., None]
+        cb = torch.from_numpy(cb).to(fg)
 
-            png = torch.cat([fg, alpha], dim=3)[0]
-            png = (png * 255.0).detach().cpu().float().numpy().clip(0, 255).astype(np.uint8)
-            result_list.append(png)
+        vis = (fg * alpha + cb * (1 - alpha))[0]
+        vis = (vis * 255.0).detach().cpu().float().numpy().clip(0, 255).astype(np.uint8)
+        vis = Image.fromarray(vis)
 
-        return result_list, vis_list
+        png = torch.cat([fg, alpha], dim=3)[0]
+        png = (png * 255.0).detach().cpu().float().numpy().clip(0, 255).astype(np.uint8)
+        png = Image.fromarray(png)
+
+        return png, vis
 
 
-class TransparentVAEEncoder(torch.nn.Module):
-    def __init__(self, filename, dtype=torch.float16, alpha=300.0, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        sd = sf.load_file(filename)
-        self.dtype = dtype
+class TransparentVAEEncoder:
+    def __init__(self, sd):
+        self.load_device = memory_management.get_torch_device()
+        self.offload_device = memory_management.unet_offload_device()
+        self.dtype = torch.float16 if memory_management.should_use_fp16(self.load_device) else torch.float32
 
         model = LatentTransparencyOffsetEncoder()
         model.load_state_dict(sd, strict=True)
-        model.to(dtype=self.dtype)
+        model.to(device=self.offload_device, dtype=self.dtype)
         model.eval()
 
-        self.model = model
-
-        # similar to LoRA's alpha to avoid initial zero-initialized outputs being too small
-        self.alpha = alpha
+        self.model = ModelPatcher(model, load_device=self.load_device, offload_device=self.offload_device)
         return
 
     @torch.no_grad()
-    def forward(self, sd_vae, list_of_np_rgba_hwc_uint8, use_offset=True):
+    def encode(self, image):
+        list_of_np_rgba_hwc_uint8 = [np.array(image)]
+        memory_management.load_model_gpu(self.model)
         list_of_np_rgb_padded = [pad_rgb(x) for x in list_of_np_rgba_hwc_uint8]
         rgb_padded_bchw_01 = torch.from_numpy(np.stack(list_of_np_rgb_padded, axis=0)).float().movedim(-1, 1)
         rgba_bchw_01 = torch.from_numpy(np.stack(list_of_np_rgba_hwc_uint8, axis=0)).float().movedim(-1, 1) / 255.0
-        rgb_bchw_01 = rgba_bchw_01[:, :3, :, :]
         a_bchw_01 = rgba_bchw_01[:, 3:, :, :]
-        vae_feed = (rgb_bchw_01 * 2.0 - 1.0) * a_bchw_01
-        vae_feed = vae_feed.to(device=sd_vae.device, dtype=sd_vae.dtype)
-        latent_dist = sd_vae.encode(vae_feed).latent_dist
-        offset_feed = torch.cat([a_bchw_01, rgb_padded_bchw_01], dim=1).to(device=sd_vae.device, dtype=self.dtype)
-        offset = self.model(offset_feed) * self.alpha
-        if use_offset:
-            latent = dist_sample_deterministic(dist=latent_dist, perturbation=offset)
-        else:
-            latent = latent_dist.sample()
-        return latent
+        offset_feed = torch.cat([a_bchw_01, rgb_padded_bchw_01], dim=1).to(device=self.load_device, dtype=self.dtype)
+        offset = self.model.model(offset_feed)
+        return offset

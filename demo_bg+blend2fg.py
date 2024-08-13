@@ -13,7 +13,7 @@ from layerdiffuse.lib_layerdiffuse.utils import (
     crop_and_resize_image,
     rgba2rgbfp32,
 )
-from utility import LayerMethod, load_models
+from utility import LayerMethod, load_models_sdxl
 
 # 加载模型
 (
@@ -26,7 +26,7 @@ from utility import LayerMethod, load_models
     unet,
     transparent_encoder,
     transparent_decoder,
-) = load_models(
+) = load_models_sdxl(
     "./models",
     "./models/juggernautXL_version6Rundiffusion.safetensors",
     LayerMethod.BG_BLEND_TO_FG,
@@ -73,12 +73,11 @@ with torch.inference_mode():
 
     # 对于双条件的method，需要concat起来
     cond_1 = load_condiction("./images/bg1.png")
-#     cond = load_condiction("./results/bg.png")
+    #     cond = load_condiction("./results/bg.png")
 
     cond_2 = load_condiction("./results/bg2ble_0_transparent.png")
-    
+
     cond = torch.cat((cond_1, cond_2), dim=1)
-    
 
     memory_management.load_models_to_gpu([text_encoder, text_encoder_2])
     positive_cond, positive_pooler = pipe.encode_cropped_prompt_77tokens(positive_tags)
@@ -104,13 +103,12 @@ with torch.inference_mode():
     # 对于2fg的，改用下两行被注释的代码
     memory_management.load_models_to_gpu([vae, transparent_decoder])
     result_list, vis_list = transparent_decoder(vae, latents)
-    
-    
+
     memory_management.load_models_to_gpu([vae])
     latents = latents.to(dtype=vae.dtype, device=vae.device) / vae.config.scaling_factor
     pixels = vae.decode(latents).sample
     pixels = (pixels * 0.5 + 0.5).clip(0, 1).movedim(1, -1)
-    
+
     result_list = []
     for i in range(int(pixels.shape[0])):
         ret = (pixels[i] * 255.0).detach().cpu().float().numpy().clip(0, 255).astype(np.uint8)

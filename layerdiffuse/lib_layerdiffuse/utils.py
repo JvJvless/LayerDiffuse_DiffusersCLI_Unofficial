@@ -103,3 +103,17 @@ def numpy_to_pytorch(x):
     y = np.ascontiguousarray(y.copy())
     y = torch.from_numpy(y).float()
     return y
+
+
+def get_attr(obj, attr):
+    attrs = attr.split(".")
+    for name in attrs:
+        obj = getattr(obj, name)
+    return obj
+
+
+def set_attr_raw(obj, attr, value):
+    attrs = attr.split(".")
+    for name in attrs[:-1]:
+        obj = getattr(obj, name)
+    setattr(obj, attrs[-1], value)
